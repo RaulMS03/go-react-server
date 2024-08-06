@@ -1,16 +1,29 @@
 package api
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
+	"log/slog"
 	"net/http"
+	"sync"
 
 	"github.com/RaulMS03/go-react-server-api/internal/store/pgstore"
+	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
+	"github.com/jackc/pgx/v5"
 
+	"github.com/go-chi/chi/middleware"
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/cors"
 )
 
 type apiHandler struct {
-	q *pgstore.Queries
-	r *chi.Mux
+	q           *pgstore.Queries
+	r           *chi.Mux
+	upgrader    websocket.Upgrader
+	subscribers map[string]map[*websocket.Conn]context.CancelFunc
+	mu          *sync.Mutex
 }
 
 func (h apiHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -19,13 +32,25 @@ func (h apiHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func NewHandler(q *pgstore.Queries) http.Handler {
 	a := apiHandler{
-		q: q,
+		q:           q,
+		upgrader:    websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }},
+		subscribers: make(map[string]map[*websocket.Conn]context.CancelFunc),
+		mu:          &sync.Mutex{},
 	}
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID, middleware.Recoverer, middleware.Logger)
 
-	r.Get("/subscribe/{room_id}", a.handleSubscribe)
+	r.Use(cors.Handler(cors.Options{
+		AllowedOrigins:   []string{"https://*", "http://*"},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
+		ExposedHeaders:   []string{"Link"},
+		AllowCredentials: false,
+		MaxAge:           300,
+	}))
+
+	r.Get("/subscribe/{room_id}", a.HandleSubscribe)
 
 	r.Route("/api", func(r chi.Router) {
 		r.Route("/rooms", func(r chi.Router) {
@@ -37,10 +62,10 @@ func NewHandler(q *pgstore.Queries) http.Handler {
 				r.Get("/", a.HandleGetRoomMessages)
 
 				r.Route("/{message_id}", func(r chi.Router) {
-					r.Get("/" a.HandleGetRoomMessage)
-					r.Patch("/react", a.handleReactToMessage)
-					r.Delete("/react", a.handleRemoveReactFromMessage)
-					r.Patch("/answer", a.handleMarkMessageAsAnswered)
+					r.Get("/", a.HandleGetRoomMessage)
+					r.Patch("/react", a.HandleReactToMessage)
+					r.Delete("/react", a.HandleRemoveReactFromMessage)
+					r.Patch("/answer", a.HandleMarkMessageAsAnswered)
 				})
 			})
 		})
@@ -50,9 +75,86 @@ func NewHandler(q *pgstore.Queries) http.Handler {
 	return a
 }
 
-func (h apiHandler) HandleCreateRoom(w http.ResponseWriter, r *http.Request) {}
+func (h apiHandler) HandleCreateRoom(w http.ResponseWriter, r *http.Request) {
+	type _body struct {
+		Theme string `json:"theme"`
+	}
 
-func (h apiHandler) HandleCreateRoomMessage(w http.ResponseWriter, r *http.Request) {}   
+	var body _body
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+
+	roomID, err := h.q.InsertRoom(r.Context(), body.Theme)
+	if err != nil {
+		slog.Error("failed to insert room", "error", err)
+		http.Error(w, "something went wrong", http.StatusInternalServerError)
+		return
+	}
+
+	type response struct {
+		ID string `json:"id"`
+	}
+
+	data, _ := json.Marshal(response{ID: roomID.String()})
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(data)
+}
+
+func (h apiHandler) HandleCreateRoomMessage(w http.ResponseWriter, r *http.Request) {
+	rawRoomID := chi.URLParam(r, "room_id")
+	roomID, err := uuid.Parse(rawRoomID)
+	if err != nil {
+		http.Error(w, "invalid room id", http.StatusBadRequest)
+		return
+	}
+
+	_, err = h.q.GetRoom(r.Context(), roomID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			http.Error(w, "room not found", http.StatusBadRequest)
+			return
+		}
+
+		http.Error(w, "something went wrong", http.StatusInternalServerError)
+		return
+	}
+
+	type _body struct {
+		Message string `json:"message"`
+	}
+
+	var body _body
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+
+	messageID, err := h.q.InsertMessage(r.Context(), pgstore.InsertMessageParams{RoomID: roomID, Message: body.Message})
+	if err != nil {
+		slog.Error("failed to insert message", "error", err)
+		http.Error(w, "somenthing went wrong", http.StatusInternalServerError)
+		return
+	}
+
+	type response struct {
+		ID string `json:"id"`
+	}
+
+	data, _ := json.Marshal(response{ID: messageID.String()})
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(data)
+
+	go h.notifyClients(Message{
+		Kind:   MessageKindMessageCreated,
+		RoomID: rawRoomID,
+		Value: MessageMessageCreate{
+			ID:      messageID.String(),
+			Message: body.Message,
+		},
+	})
+}
 
 func (h apiHandler) HandleGetRoom(w http.ResponseWriter, r *http.Request) {}
 
@@ -62,8 +164,83 @@ func (h apiHandler) HandleGetRoomMessages(w http.ResponseWriter, r *http.Request
 
 func (h apiHandler) HandleReactToMessage(w http.ResponseWriter, r *http.Request) {}
 
-func (h apiHandler) handleRemoveReactFromMessage(w http.ResponseWriter, r *http.Request) {}
+func (h apiHandler) HandleRemoveReactFromMessage(w http.ResponseWriter, r *http.Request) {}
 
-func (h apiHandler) handleMarkMessageAsAnswered(w http.ResponseWriter, r *http.Request) {}
+func (h apiHandler) HandleMarkMessageAsAnswered(w http.ResponseWriter, r *http.Request) {}
 
-func (h apiHandler) handleSubscribe(w http.ResponseWriter, r *http.Request) {}
+const (
+	MessageKindMessageCreated = "message_created"
+)
+
+type MessageMessageCreate struct {
+	ID      string `json:"id"`
+	Message string `json:"message"`
+}
+
+type Message struct {
+	Kind   string `json:"kind"`
+	Value  any    `json:"value"`
+	RoomID string `json:"-"`
+}
+
+func (h apiHandler) notifyClients(msg Message) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	subscribers, ok := h.subscribers[msg.RoomID]
+	if !ok || len(subscribers) == 0 {
+		return
+	}
+
+	for conn, cancel := range subscribers {
+		if err := conn.WriteJSON(msg); err != nil {
+			slog.Error("failed to send message to client", "error", err)
+			cancel()
+		}
+	}
+}
+
+func (h apiHandler) HandleSubscribe(w http.ResponseWriter, r *http.Request) {
+	rawRoomID := chi.URLParam(r, "room_id")
+	roomID, err := uuid.Parse(rawRoomID)
+	if err != nil {
+		http.Error(w, "invalid room id", http.StatusBadRequest)
+		return
+	}
+
+	_, err = h.q.GetRoom(r.Context(), roomID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			http.Error(w, "room not found", http.StatusBadRequest)
+			return
+		}
+
+		http.Error(w, "something went wrong", http.StatusInternalServerError)
+		return
+	}
+
+	c, err := h.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		slog.Warn("failed to upgrade connection", "error", err)
+		http.Error(w, "failed to upgrade to ws connection", http.StatusBadRequest)
+		return
+	}
+
+	defer c.Close()
+
+	ctx, cancel := context.WithCancel(r.Context())
+
+	h.mu.Lock()
+	if _, ok := h.subscribers[rawRoomID]; !ok {
+		h.subscribers[rawRoomID] = make(map[*websocket.Conn]context.CancelFunc)
+	}
+	slog.Info("new client connected", "room_id", rawRoomID, "client_ip", r.RemoteAddr)
+	h.subscribers[rawRoomID][c] = cancel
+	h.mu.Unlock()
+
+	<-ctx.Done()
+
+	h.mu.Lock()
+	delete(h.subscribers[rawRoomID], c)
+	h.mu.Unlock()
+}
