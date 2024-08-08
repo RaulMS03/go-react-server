@@ -343,7 +343,7 @@ func (h apiHandler) handleRemoveReactFromMessage(w http.ResponseWriter, r *http.
 		return
 	}
 
-	count, err := h.q.RemoveReactionFromMessage(r.Context(), id)
+	count, err := h.q.RemoveReactFromMessage(r.Context(), id)
 	if err != nil {
 		http.Error(w, "something went wrong", http.StatusInternalServerError)
 		slog.Error("failed to react to message", "error", err)
